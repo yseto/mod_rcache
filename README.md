@@ -14,6 +14,9 @@ RewriteEngine On
 <IfModule rcache_module>
 RedisHostname localhost
 RedisPort 6379
+RedisCachePrefix R:
+RedisCachePrefixWaitFlag RW:
+RedisCacheEnvRetrieveUrl RETURL
 </IfModule>
 
 <Location "/foo/">

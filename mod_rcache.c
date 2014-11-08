@@ -12,16 +12,19 @@
 #include <unistd.h>
 
 typedef struct {
-    char*   data;
-    char*   type;
-    int     length;
+    char* data;
+    char* type;
+    int length;
     apr_time_t mtime;
 
     request_rec* r;
     redisContext* c;
     redisReply *reply;
-    char*   hostname;
-    int     port;
+    char* hostname;
+    char* prefix;
+    char* prefix_wait;
+    char* env_retrieve_url;
+    int port;
 } rcache_info;
 
 //#define DEBUG
@@ -33,6 +36,9 @@ static void *create_config(apr_pool_t *pool, server_rec *s)
     rcache_info *info = apr_pcalloc(pool, sizeof(rcache_info));
     info->hostname = apr_pstrdup(pool, "127.0.0.1");
     info->port = 6379;
+    info->prefix = "RCACHE:";
+    info->prefix_wait = "RCACHE_WAIT:";
+    info->env_retrieve_url = "ENVTEST";
     return info;
 }
 
@@ -160,7 +166,7 @@ static int rcache_handler(request_rec *r)
 
     int wait = 0;
 
-    if ( (retrieve_url = apr_table_get(r->subprocess_env, "ENVTEST")) ) {
+    if ( (retrieve_url = apr_table_get(r->subprocess_env, info->env_retrieve_url)) ) {
 
 #ifdef DEBUG
         ap_log_error(APLOG_MARK, APLOG_ERR, 0, r->server, "%s", r->path_info);
@@ -168,30 +174,40 @@ static int rcache_handler(request_rec *r)
 #endif
 
         // WAIT flag check.
-        reply = redisCommand(c, "GET WAIT::%s", r->path_info);
-        if( reply->type !=  REDIS_REPLY_NIL ) {
+        reply = redisCommand(c, "GET %s%s", info->prefix_wait, r->path_info);
+        if( reply->type != REDIS_REPLY_NIL ) {
+            // cache hot-replace check.
+            if ( reply->type == REDIS_REPLY_STRING && 0 == strcmp(reply->str,"HOT") ){
+                redisCommand(c, "DEL %s%s", info->prefix_wait, r->path_info);
+#ifdef DEBUG
+                ap_log_error(APLOG_MARK, APLOG_ERR, 0, r->server, "hot cache replace: %s", r->path_info );
+#endif
+                goto gencache;
+            }
+
+            // wait cache create.
             wait = 1;
             int loop = 10;
             while(loop){
-                reply = redisCommand(c, "GET WAIT::%s", r->path_info);
+                reply = redisCommand(c, "GET %s%s", info->prefix_wait, r->path_info);
 #ifdef DEBUG
                 ap_log_error(APLOG_MARK, APLOG_ERR, 0, r->server, "wait loop: remain %d sec", loop);
 #endif
-                if( reply->type ==  REDIS_REPLY_NIL ) {
+                if( reply->type == REDIS_REPLY_NIL ) {
                     goto read;
                 }
                 sleep(1);
                 loop--;
             }
             // when timeup. delete flag.
-            redisCommand(c, "DEL WAIT::%s", r->path_info);
+            redisCommand(c, "DEL %s%s", info->prefix_wait, r->path_info);
             goto gencache;
         }
 
 read:
         // read from redis.
-        reply = redisCommand(c, "HMGET %s CONTENT TYPE LENGTH MTIME", r->path_info);
-        if( reply->type ==  REDIS_REPLY_ARRAY ) {
+        reply = redisCommand(c, "HMGET %s%s CONTENT TYPE LENGTH MTIME", info->prefix, r->path_info);
+        if( reply->type == REDIS_REPLY_ARRAY ) {
             if ( reply->element[0]->len == 0 ) goto gencache;
 
             const char* tmp = apr_pstrdup(r->pool, reply->element[1]->str);
@@ -222,7 +238,7 @@ read:
 gencache:
 
     if (wait == 0)
-        redisCommand(c, "SET WAIT::%s 1", r->path_info);
+        redisCommand(c, "SET %s%s 1", info->prefix_wait, r->path_info);
 
     rv = rcache_curl(retrieve_url, info);
 
@@ -234,8 +250,8 @@ gencache:
         if (info->length == 0)
             info->length = strlen(info->data);
 
-        redisCommand(c,"HMSET %s CONTENT %s TYPE %s LENGTH %d MTIME %ld",
-                r->path_info, info->data, info->type, info->length, info->mtime);
+        redisCommand(c,"HMSET %s%s CONTENT %s TYPE %s LENGTH %d MTIME %ld",
+                info->prefix, r->path_info, info->data, info->type, info->length, info->mtime);
 
         ap_set_content_type(r, info->type);
         ap_set_content_length(r, info->length);
@@ -246,7 +262,7 @@ gencache:
         if (!r->header_only)
             ap_rputs(info->data, r);
     }
-    redisCommand(c, "DEL WAIT::%s", r->path_info);
+    redisCommand(c, "DEL %s%s", info->prefix_wait, r->path_info);
 
 finish:
 //  freeReplyObject(reply);
@@ -274,9 +290,33 @@ static const char* rcache_set_var_hostname(cmd_parms* cmd, void* dummy, const ch
     return NULL;
 }
 
+static const char* rcache_set_var_prefix(cmd_parms* cmd, void* dummy, const char* arg)
+{
+    rcache_info* info = ap_get_module_config(cmd->server->module_config, &rcache_module);
+    info->prefix = apr_pstrdup(cmd->pool, arg);
+    return NULL;
+}
+
+static const char* rcache_set_var_prefix_wait(cmd_parms* cmd, void* dummy, const char* arg)
+{
+    rcache_info* info = ap_get_module_config(cmd->server->module_config, &rcache_module);
+    info->prefix_wait = apr_pstrdup(cmd->pool, arg);
+    return NULL;
+}
+
+static const char* rcache_set_var_retrieve_url(cmd_parms* cmd, void* dummy, const char* arg)
+{
+    rcache_info* info = ap_get_module_config(cmd->server->module_config, &rcache_module);
+    info->env_retrieve_url = apr_pstrdup(cmd->pool, arg);
+    return NULL;
+}
+
 static const command_rec rcache_cmds[] = {
     AP_INIT_TAKE1("RedisHostname", rcache_set_var_hostname, NULL, OR_ALL, "Redis Server Hostname"),
-    AP_INIT_TAKE1("RedisPort",     rcache_set_var_port,     NULL, OR_ALL, "Redis Server Port"),
+    AP_INIT_TAKE1("RedisPort", rcache_set_var_port, NULL, OR_ALL, "Redis Server Port"),
+    AP_INIT_TAKE1("RedisCachePrefix", rcache_set_var_prefix, NULL, OR_ALL, "Redis Cache prefix"),
+    AP_INIT_TAKE1("RedisCachePrefixWaitFlag", rcache_set_var_prefix_wait, NULL, OR_ALL, "Redis Cache prefix for wait flag"),
+    AP_INIT_TAKE1("RedisCacheEnvRetrieveUrl", rcache_set_var_retrieve_url, NULL, OR_ALL, "Redis Cache Retrieve Url Enviroment Variable"),
     {NULL}
 };
 
