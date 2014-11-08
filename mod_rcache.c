@@ -13,8 +13,28 @@
 
 typedef struct {
     char*   data;
+    char*   type;
+    char*   length;
+    apr_time_t mtime;
+
     request_rec* r;
+    redisContext* c;
+    redisReply *reply;
+    char*   hostname;
+    int     port;
 } rcache_info;
+
+//#define DEBUG
+
+extern module AP_MODULE_DECLARE_DATA rcache_module ;
+
+static void *create_config(apr_pool_t *pool, server_rec *s)
+{
+    rcache_info *info = apr_pcalloc(pool, sizeof(rcache_info));
+    info->hostname = apr_pstrdup(pool, "127.0.0.1");
+    info->port = 6379;
+    return info;
+}
 
 static size_t rcache_curl_write_cb(const void* ptr, size_t size, size_t nmemb, void* _info)
 {
@@ -28,10 +48,9 @@ static size_t rcache_curl_write_cb(const void* ptr, size_t size, size_t nmemb, v
 static size_t rcache_curl_header_cb(const void* ptr, size_t size, size_t nmemb, void* _info)
 {
     rcache_info* info = _info;
-    apr_time_t current_time = apr_time_now();
     if (strncmp(ptr, "HTTP/1.", sizeof("HTTP/1.") - 1) == 0) {
         int minor_ver, status;
-        if (sscanf(ptr, "HTTP/1.%d %d ", &minor_ver, &status) == 2 && status != 200)
+        if (sscanf(ptr, "HTTP/1.%d %d ", &minor_ver, &status) == 2 && (status != 200 || status != 301 || status != 302) )
             info->r->status = status;
     } else if (strncasecmp(ptr, "content-type:", sizeof("content-type:") - 1) == 0) {
         const char* s = (const char*)ptr + sizeof("content-type:") - 1,
@@ -43,7 +62,7 @@ static size_t rcache_curl_header_cb(const void* ptr, size_t size, size_t nmemb, 
             if (*s != ' ' && *s != '\t')
                 break;
         if (s <= e)
-            ap_set_content_type(info->r, apr_pstrndup(info->r->pool, s, e - s + 1));
+            info->type = apr_pstrndup(info->r->pool, s, e - s + 1);
     } else if (strncasecmp(ptr, "content-length:", sizeof("content-length:") - 1) == 0) {
         const char* s = (const char*)ptr + sizeof("content-length:") - 1,
               * e = (const char*)ptr + size * nmemb - 1;
@@ -54,11 +73,9 @@ static size_t rcache_curl_header_cb(const void* ptr, size_t size, size_t nmemb, 
             if (*s != ' ' && *s != '\t')
                 break;
         if (s <= e)
-            ap_set_content_length(info->r, atoi(apr_pstrndup(info->r->pool, s, e - s + 1)));
+            info->length = apr_pstrndup(info->r->pool, s, e - s + 1);
     }
-    ap_update_mtime(info->r, current_time);
-    ap_set_last_modified(info->r);
-
+    info->mtime = apr_time_now();
     return nmemb;
 }
 
@@ -72,11 +89,12 @@ static int rcache_curl(const char *retrieve_url, void* _info)
     }
     curl_easy_setopt(curl, CURLOPT_URL, retrieve_url);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1);
+    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5);
     curl_easy_setopt(curl, CURLOPT_WRITEHEADER, _info);
     curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, rcache_curl_header_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, _info);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, rcache_curl_write_cb);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, apr_psprintf(info->r->pool, "mod_rcache/%s", curl_version()));
+//  curl_easy_setopt(curl, CURLOPT_USERAGENT, apr_psprintf(info->r->pool, "mod_rcache/%s", curl_version()));
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5);
     ret = curl_easy_perform(curl);
     curl_easy_cleanup(curl);
@@ -92,12 +110,13 @@ static int rcache_curl(const char *retrieve_url, void* _info)
     return info->r->status;
 }
 
-/* The sample content handler */
+/* The content handler */
 static int rcache_handler(request_rec *r)
 {
-    rcache_info info;
-    info.data = "";
-    info.r = r;
+    rcache_info *info;
+    info = ap_get_module_config(r->server->module_config, &rcache_module);
+    info->data = "";
+    info->r = r;
     apr_status_t rv;
     const char *retrieve_url;
 
@@ -105,15 +124,29 @@ static int rcache_handler(request_rec *r)
         return DECLINED;
     }
 
-    // connect redis
-    redisContext *c;
-    redisReply *reply;
-    struct timeval timeout = { 1, 500000 }; // 1.5 seconds
-    c = redisConnectWithTimeout("127.0.0.1", 6379, timeout);
+    // redis context
+    redisContext *c = info->c;
+    redisReply *reply = info->reply;
+
+    // redis connection
+    if (!c) {
+        struct timeval timeout = { 1, 500000 }; // 1.5 seconds
+        c = redisConnectWithTimeout(info->hostname, info->port, timeout);
+        info->c = c;
+
+        // ping pong test
+        if ( !(c == NULL || c->err) ) {
+            reply = redisCommand(c,"PING");
+#ifdef DEBUG
+            ap_log_error(APLOG_MARK, APLOG_ERR, 0, r->server, "PING: %s", reply->str);
+#endif
+        }
+    }
+
+    // when redis connection error
     if (c == NULL || c->err) {
         if (c) {
             ap_log_error(APLOG_MARK, APLOG_ERR, 0, r->server, "Connection error: %s", c->errstr);
-            redisFree(c);
         } else {
             ap_log_error(APLOG_MARK, APLOG_ERR, 0, r->server, "Connection error: can't allocate redis context" );
         }
@@ -124,9 +157,10 @@ static int rcache_handler(request_rec *r)
     int wait = 0;
 
     if ( (retrieve_url = apr_table_get(r->subprocess_env, "ENVTEST")) ) {
+
 #ifdef DEBUG
-    ap_log_error(APLOG_MARK, APLOG_ERR, 0, r->server, "%s", r->path_info);
-    ap_log_error(APLOG_MARK, APLOG_ERR, 0, r->server, "%s", retrieve_url);
+        ap_log_error(APLOG_MARK, APLOG_ERR, 0, r->server, "%s", r->path_info);
+        ap_log_error(APLOG_MARK, APLOG_ERR, 0, r->server, "%s", retrieve_url);
 #endif
 
         // WAIT flag check.
@@ -136,7 +170,9 @@ static int rcache_handler(request_rec *r)
             int loop = 10;
             while(loop){
                 reply = redisCommand(c, "GET WAIT::%s", r->path_info);
-                ap_log_error(APLOG_MARK, APLOG_ERR, 0, r->server, "%d", loop);
+#ifdef DEBUG
+                ap_log_error(APLOG_MARK, APLOG_ERR, 0, r->server, "wait loop: remain %d sec", loop);
+#endif
                 if( reply->type ==  REDIS_REPLY_NIL ) {
                     goto read;
                 }
@@ -149,7 +185,7 @@ static int rcache_handler(request_rec *r)
         }
 
 read:
-
+        // read from redis.
         reply = redisCommand(c, "HMGET %s CONTENT TYPE LENGTH MTIME", r->path_info);
         if( reply->type ==  REDIS_REPLY_ARRAY ) {
             if ( reply->element[0]->len == 0 ) goto gencache;
@@ -163,7 +199,6 @@ read:
             ap_update_mtime(r, time);
             ap_set_last_modified(r);
 
-
             rv = OK;
             goto finish;
         }
@@ -174,26 +209,29 @@ read:
 
 gencache:
 
-    if(wait == 0)
+    if (wait == 0)
         redisCommand(c, "SET WAIT::%s 1", r->path_info);
 
-    rv = rcache_curl(retrieve_url, &info);
-#ifdef DEBUG
-    ap_log_error(APLOG_MARK, APLOG_ERR, 0, r->server, "azz");
-#endif
+    rv = rcache_curl(retrieve_url, info);
 
+    // set content to redis
     if (rv == HTTP_OK) {
-        redisCommand(c,"HMSET %s CONTENT %s TYPE %s LENGTH %d MTIME %ld",
-                r->path_info, info.data, r->content_type, r->clength, r->mtime);
+        redisCommand(c,"HMSET %s CONTENT %s TYPE %s LENGTH %s MTIME %ld",
+                r->path_info, info->data, info->type, info->length, info->mtime);
+
+        ap_set_content_type(r, info->type);
+        ap_set_content_length(r, atoi(info->length) );
+        ap_update_mtime(r, info->mtime);
+        ap_set_last_modified(r);
+
+        if (!r->header_only)
+            ap_rputs(info->data, r);
     }
     redisCommand(c, "DEL WAIT::%s", r->path_info);
 
-    if (!r->header_only)
-        ap_rputs(info.data, r);
-
 finish:
-    freeReplyObject(reply);
-    redisFree(c);
+//  freeReplyObject(reply);
+//  redisFree(c);
 
     return rv;
 }
@@ -203,14 +241,34 @@ static void rcache_register_hooks(apr_pool_t *p)
     ap_hook_handler(rcache_handler, NULL, NULL, APR_HOOK_MIDDLE);
 }
 
+static const char* rcache_set_var_port(cmd_parms* cmd, void* dummy, const char* arg)
+{
+    rcache_info* info = ap_get_module_config(cmd->server->module_config, &rcache_module);
+    info->port = atoi( apr_pstrdup(cmd->pool, arg) );
+    return NULL;
+}
+
+static const char* rcache_set_var_hostname(cmd_parms* cmd, void* dummy, const char* arg)
+{
+    rcache_info* info = ap_get_module_config(cmd->server->module_config, &rcache_module);
+    info->hostname = apr_pstrdup(cmd->pool, arg);
+    return NULL;
+}
+
+static const command_rec rcache_cmds[] = {
+    AP_INIT_TAKE1("RedisHostname", rcache_set_var_hostname, NULL, OR_ALL, "Redis Server Hostname"),
+    AP_INIT_TAKE1("RedisPort",     rcache_set_var_port,     NULL, OR_ALL, "Redis Server Port"),
+    {NULL}
+};
+
 /* Dispatch list for API hooks */
 module AP_MODULE_DECLARE_DATA rcache_module = {
     STANDARD20_MODULE_STUFF,
-    NULL,   /* create per-dir    config structures */
-    NULL,   /* merge  per-dir    config structures */
-    NULL,   /* create per-server config structures */
-    NULL,   /* merge  per-server config structures */
-    NULL,   /* table of config file commands       */
-    rcache_register_hooks   /* register hooks      */
+    NULL,
+    NULL,
+    create_config,
+    NULL,
+    rcache_cmds,
+    rcache_register_hooks
 };
 
