@@ -91,6 +91,7 @@ static int rcache_curl(const char *retrieve_url, void* _info)
 #endif
     return info->r->status;
 }
+
 /* The sample content handler */
 static int rcache_handler(request_rec *r)
 {
@@ -123,14 +124,18 @@ static int rcache_handler(request_rec *r)
     int wait = 0;
 
     if ( (retrieve_url = apr_table_get(r->subprocess_env, "ENVTEST")) ) {
+#ifdef DEBUG
+    ap_log_error(APLOG_MARK, APLOG_ERR, 0, r->server, "%s", r->path_info);
+    ap_log_error(APLOG_MARK, APLOG_ERR, 0, r->server, "%s", retrieve_url);
+#endif
 
         // WAIT flag check.
-        reply = redisCommand(c, "GET WAIT::%s", retrieve_url);
+        reply = redisCommand(c, "GET WAIT::%s", r->path_info);
         if( reply->type !=  REDIS_REPLY_NIL ) {
             wait = 1;
             int loop = 10;
             while(loop){
-                reply = redisCommand(c, "GET WAIT::%s", retrieve_url);
+                reply = redisCommand(c, "GET WAIT::%s", r->path_info);
                 ap_log_error(APLOG_MARK, APLOG_ERR, 0, r->server, "%d", loop);
                 if( reply->type ==  REDIS_REPLY_NIL ) {
                     goto read;
@@ -139,12 +144,13 @@ static int rcache_handler(request_rec *r)
                 loop--;
             }
             // when timeup. delete flag.
-            redisCommand(c, "DEL WAIT::%s", retrieve_url);
+            redisCommand(c, "DEL WAIT::%s", r->path_info);
             goto gencache;
         }
+
 read:
 
-        reply = redisCommand(c, "HMGET %s CONTENT TYPE LENGTH MTIME", retrieve_url);
+        reply = redisCommand(c, "HMGET %s CONTENT TYPE LENGTH MTIME", r->path_info);
         if( reply->type ==  REDIS_REPLY_ARRAY ) {
             if ( reply->element[0]->len == 0 ) goto gencache;
             if (!r->header_only)
@@ -169,7 +175,7 @@ read:
 gencache:
 
     if(wait == 0)
-        redisCommand(c, "SET WAIT::%s 1", retrieve_url);
+        redisCommand(c, "SET WAIT::%s 1", r->path_info);
 
     rv = rcache_curl(retrieve_url, &info);
 #ifdef DEBUG
@@ -178,9 +184,9 @@ gencache:
 
     if (rv == HTTP_OK) {
         redisCommand(c,"HMSET %s CONTENT %s TYPE %s LENGTH %d MTIME %ld",
-                retrieve_url, info.data, r->content_type, r->clength, r->mtime);
-        redisCommand(c, "DEL WAIT::%s", retrieve_url);
+                r->path_info, info.data, r->content_type, r->clength, r->mtime);
     }
+    redisCommand(c, "DEL WAIT::%s", r->path_info);
 
     if (!r->header_only)
         ap_rputs(info.data, r);
