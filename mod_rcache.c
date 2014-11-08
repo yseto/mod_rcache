@@ -14,7 +14,7 @@
 typedef struct {
     char*   data;
     char*   type;
-    char*   length;
+    int     length;
     apr_time_t mtime;
 
     request_rec* r;
@@ -73,7 +73,7 @@ static size_t rcache_curl_header_cb(const void* ptr, size_t size, size_t nmemb, 
             if (*s != ' ' && *s != '\t')
                 break;
         if (s <= e)
-            info->length = apr_pstrndup(info->r->pool, s, e - s + 1);
+            info->length = atoi( apr_pstrndup(info->r->pool, s, e - s + 1) );
     }
     info->mtime = apr_time_now();
     return nmemb;
@@ -94,7 +94,7 @@ static int rcache_curl(const char *retrieve_url, void* _info)
     curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, rcache_curl_header_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, _info);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, rcache_curl_write_cb);
-//  curl_easy_setopt(curl, CURLOPT_USERAGENT, apr_psprintf(info->r->pool, "mod_rcache/%s", curl_version()));
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, apr_psprintf(info->r->pool, "mod_rcache/%s", curl_version()));
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5);
     ret = curl_easy_perform(curl);
     curl_easy_cleanup(curl);
@@ -117,6 +117,9 @@ static int rcache_handler(request_rec *r)
     info = ap_get_module_config(r->server->module_config, &rcache_module);
     info->data = "";
     info->r = r;
+    info->length = 0;
+    info->type = "";
+
     apr_status_t rv;
     const char *retrieve_url;
 
@@ -216,11 +219,17 @@ gencache:
 
     // set content to redis
     if (rv == HTTP_OK) {
-        redisCommand(c,"HMSET %s CONTENT %s TYPE %s LENGTH %s MTIME %ld",
+        if (strcmp(info->type,""))
+            info->type = "text/html";
+
+        if (info->length == 0)
+            info->length = strlen(info->data);
+
+        redisCommand(c,"HMSET %s CONTENT %s TYPE %s LENGTH %d MTIME %ld",
                 r->path_info, info->data, info->type, info->length, info->mtime);
 
         ap_set_content_type(r, info->type);
-        ap_set_content_length(r, atoi(info->length) );
+        ap_set_content_length(r, info->length);
         ap_update_mtime(r, info->mtime);
         ap_set_last_modified(r);
 
