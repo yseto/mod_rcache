@@ -124,7 +124,8 @@ static int rcache_handler(request_rec *r)
     const char *retrieve_url;
 
     if (strcmp(r->handler, "rcache")) {
-        return DECLINED;
+        rv = DECLINED;
+        goto finish;
     }
 
     // redis context
@@ -192,15 +193,23 @@ read:
         reply = redisCommand(c, "HMGET %s CONTENT TYPE LENGTH MTIME", r->path_info);
         if( reply->type ==  REDIS_REPLY_ARRAY ) {
             if ( reply->element[0]->len == 0 ) goto gencache;
-            if (!r->header_only)
-                ap_rputs(reply->element[0]->str, r);
 
-            const char* tmp = apr_psprintf(r->pool, "%s", reply->element[1]->str);
+            const char* tmp = apr_pstrdup(r->pool, reply->element[1]->str);
             ap_set_content_type(r, tmp);
             ap_set_content_length(r, atoi(reply->element[2]->str) );
             apr_time_t time = atol(reply->element[3]->str);
             ap_update_mtime(r, time);
             ap_set_last_modified(r);
+            ap_set_etag(r);
+
+            apr_status_t rc = ap_meets_conditions(r);
+            if (rc != OK) {
+                rv = rc;
+                goto finish;
+            }
+
+            if (!r->header_only)
+                ap_rputs(reply->element[0]->str, r);
 
             rv = OK;
             goto finish;
@@ -232,6 +241,7 @@ gencache:
         ap_set_content_length(r, info->length);
         ap_update_mtime(r, info->mtime);
         ap_set_last_modified(r);
+        ap_set_etag(r);
 
         if (!r->header_only)
             ap_rputs(info->data, r);
