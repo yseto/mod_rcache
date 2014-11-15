@@ -28,6 +28,8 @@ typedef struct {
 } rcache_info;
 
 //#define DEBUG
+//#define FLAG_WAIT
+//#define CONN_PERSISTENT
 
 extern module AP_MODULE_DECLARE_DATA rcache_module ;
 
@@ -134,11 +136,11 @@ static int rcache_handler(request_rec *r)
         goto finish;
     }
 
-    // redis context
+    // redis context and connection
+#ifdef CONN_PERSISTENT
     redisContext *c = info->c;
     redisReply *reply = info->reply;
 
-    // redis connection
     if (!c) {
         struct timeval timeout = { 1, 500000 }; // 1.5 seconds
         c = redisConnectWithTimeout(info->hostname, info->port, timeout);
@@ -152,6 +154,13 @@ static int rcache_handler(request_rec *r)
 #endif
         }
     }
+#else
+    redisContext *c;
+    redisReply *reply;
+
+    struct timeval timeout = { 1, 500000 }; // 1.5 seconds
+    c = redisConnectWithTimeout(info->hostname, info->port, timeout);
+#endif
 
     // when redis connection error
     if (c == NULL || c->err) {
@@ -273,8 +282,10 @@ gencache:
 #endif
 
 finish:
-//  freeReplyObject(reply);
-//  redisFree(c);
+#ifndef CONN_PERSISTENT
+    freeReplyObject(reply);
+    redisFree(c);
+#endif
 
     return rv;
 }
