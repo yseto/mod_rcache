@@ -164,7 +164,9 @@ static int rcache_handler(request_rec *r)
         goto finish;
     }
 
+#ifdef FLAG_WAIT
     int wait = 0;
+#endif
 
     if ( (retrieve_url = apr_table_get(r->subprocess_env, info->env_retrieve_url)) ) {
 
@@ -173,6 +175,7 @@ static int rcache_handler(request_rec *r)
         ap_log_error(APLOG_MARK, APLOG_ERR, 0, r->server, "%s", retrieve_url);
 #endif
 
+#ifdef FLAG_WAIT
         // WAIT flag check.
         reply = redisCommand(c, "GET %s%s", info->prefix_wait, r->path_info);
         if( reply->type != REDIS_REPLY_NIL ) {
@@ -203,6 +206,7 @@ static int rcache_handler(request_rec *r)
             redisCommand(c, "DEL %s%s", info->prefix_wait, r->path_info);
             goto gencache;
         }
+#endif
 
 read:
         // read from redis.
@@ -237,8 +241,10 @@ read:
 
 gencache:
 
+#ifdef FLAG_WAIT
     if (wait == 0)
         redisCommand(c, "SET %s%s 1", info->prefix_wait, r->path_info);
+#endif
 
     rv = rcache_curl(retrieve_url, info);
 
@@ -262,7 +268,9 @@ gencache:
         if (!r->header_only)
             ap_rputs(info->data, r);
     }
+#ifdef FLAG_WAIT
     redisCommand(c, "DEL %s%s", info->prefix_wait, r->path_info);
+#endif
 
 finish:
 //  freeReplyObject(reply);
